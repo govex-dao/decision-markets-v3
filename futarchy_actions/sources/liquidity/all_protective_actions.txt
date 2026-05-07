@@ -1,0 +1,891 @@
+================================================================================
+== protective_bid_init_actions.move
+================================================================================
+
+// Copyright (c) Govex DAO LLC
+// SPDX-License-Identifier: BUSL-1.1
+
+/// Protective Bid Init Actions for Governance
+///
+/// This module provides governance-controlled actions for creating protective bids:
+/// - CreateProtectiveBid: Create a NAV bid wall for token holders
+///
+/// Flow:
+/// 1. DAO passes proposal to create protective bid
+/// 2. VaultSpend puts stable coins in executable_resources
+/// 3. CreateProtectiveBid takes from resources -> creates shared protective bid
+/// 4. Token holders can sell to bid at NAV price
+///
+/// For cancellation, see protective_bid_actions.move
+
+module futarchy_actions::protective_bid_init_actions;
+
+public struct ExecutionProgressWitness has drop {}
+
+
+use account_actions::action_spec_builder;
+use account_protocol::account::{Self as account_mod, Account};
+use account_protocol::action_events;
+use account_protocol::action_validation;
+use account_protocol::bcs_validation;
+use account_protocol::executable::{Self, Executable};
+use account_protocol::executable_resources;
+use account_protocol::intents;
+use account_protocol::package_registry::PackageRegistry;
+use futarchy_core::futarchy_config::{Self, FutarchyConfig};
+use futarchy_markets_core::protective_bid;
+use futarchy_markets_core::protective_bid_registry;
+use std::string::{Self, String};
+use std::type_name;
+use sui::bcs;
+use sui::clock::Clock;
+use sui::coin;
+use sui::event;
+use sui::transfer;
+
+// === Errors ===
+
+const EUnsupportedActionVersion: u64 = 1;
+const EZeroStable: u64 = 3;
+const ENoSpotPool: u64 = 5;
+const EWrongDaoTypes: u64 = 6;
+const EInvalidPrincipalOverride: u64 = 7;
+
+// === Action Type Markers ===
+// Token types are encoded in the marker to prevent executor from changing types
+
+/// Create protective bid action marker
+/// RaiseToken and StableCoin are encoded to ensure executor uses correct types
+public struct CreateProtectiveBid<phantom RaiseToken, phantom StableCoin> has drop {}
+
+// === Events ===
+
+/// Emitted when a protective bid is created via governance
+public struct ProtectiveBidCreatedViaGovernance has copy, drop {
+    bid_id: ID,
+    account_id: ID,
+    pool_id: ID,
+    base_fee_bps: u64,
+    surge_fee_bps: u64,
+    surge_duration_ms: u64,
+    initial_stable: u64,
+}
+
+// === Action Structs for Proposal System ===
+
+/// Action data for creating a protective bid
+/// Stable coins come from executable_resources (put there by prior VaultSpend)
+/// Pool ID is read from FutarchyConfig.spot_pool_id at execution time (no staging needed)
+/// NAV principal mode:
+/// - dao_amm_asset_principal = 0 and dao_amm_stable_principal = 0 => use pool initial reserves
+/// - both non-zero => use explicit fixed principal override
+public struct CreateProtectiveBidAction has copy, drop, store {
+    /// Name of the resource in executable_resources to take stable coins from
+    stable_resource_name: String,
+    /// Base fee in basis points (final fee after surge ends, max 2000 = 20%)
+    base_fee_bps: u64,
+    /// Starting fee in basis points (0 = no surge, use base_fee_bps)
+    surge_fee_bps: u64,
+    /// Duration of surge period in milliseconds (0 = no surge)
+    surge_duration_ms: u64,
+    /// DAO AMM principal RaiseToken amount to use in NAV (fixed, optional via zero sentinel).
+    dao_amm_asset_principal: u64,
+    /// DAO AMM principal StableCoin amount to use in NAV (fixed, optional via zero sentinel).
+    dao_amm_stable_principal: u64,
+}
+
+// === Spec Builders (for proposal PTB construction) ===
+
+/// Add CreateProtectiveBidAction to Builder
+/// Used for staging actions in proposals via PTB
+/// Pool ID is read from FutarchyConfig.spot_pool_id at execution time
+/// NAV principal mode:
+/// - dao_amm_asset_principal = 0 and dao_amm_stable_principal = 0 => use pool initial reserves
+/// - both non-zero => use explicit fixed principal override
+public fun add_create_protective_bid_spec<RaiseToken, StableCoin>(
+    builder: &mut action_spec_builder::Builder,
+    stable_resource_name: String,
+    base_fee_bps: u64,
+    surge_fee_bps: u64,
+    surge_duration_ms: u64,
+    dao_amm_asset_principal: u64,
+    dao_amm_stable_principal: u64,
+) {
+    // Capture action_index BEFORE adding spec
+    let action_index = action_spec_builder::next_action_index(builder);
+
+    let action = CreateProtectiveBidAction {
+        stable_resource_name,
+        base_fee_bps,
+        surge_fee_bps,
+        surge_duration_ms,
+        dao_amm_asset_principal,
+        dao_amm_stable_principal,
+    };
+
+    // Serialize
+    let action_data = bcs::to_bytes(&action);
+
+    // CRITICAL: Use marker type (not action struct type) for validation
+    // Token types encoded in marker to prevent type substitution
+    let action_spec = intents::new_action_spec_with_typename(
+        type_name::with_original_ids<CreateProtectiveBid<RaiseToken, StableCoin>>(),
+        action_data,
+        1, // version
+    );
+    action_spec_builder::add(builder, action_spec);
+
+    // Emit ActionParamsStaged event
+    let mut params = action_events::new_builder();
+    action_events::add_string(&mut params, b"stable_resource_name", stable_resource_name);
+    action_events::add_u64(&mut params, b"base_fee_bps", base_fee_bps);
+    action_events::add_u64(&mut params, b"surge_fee_bps", surge_fee_bps);
+    action_events::add_u64(&mut params, b"surge_duration_ms", surge_duration_ms);
+    action_events::add_u64(&mut params, b"dao_amm_asset_principal", dao_amm_asset_principal);
+    action_events::add_u64(&mut params, b"dao_amm_stable_principal", dao_amm_stable_principal);
+    action_events::emit_action_params(
+        params,
+        action_spec_builder::source_type(builder),
+        action_spec_builder::source_id(builder),
+        action_spec_builder::outcome_index(builder),
+        type_name::with_original_ids<CreateProtectiveBid<RaiseToken, StableCoin>>().into_string().to_string(),
+        action_index,
+    );
+}
+
+// === Execution Functions (for Proposal System) ===
+
+/// Execute create protective bid action from proposal
+/// Takes stable coins from executable_resources (put there by prior VaultSpend)
+/// Creates a shared ProtectiveBid for token holders to sell to
+/// Pool ID is read from FutarchyConfig.spot_pool_id (ensures bid points to DAO's own pool)
+public fun do_create_protective_bid<RaiseToken, StableCoin, Outcome: store, IW: drop>(
+    executable: &mut Executable<Outcome>,
+    account: &mut Account,
+    registry: &PackageRegistry,
+    clock: &Clock,
+    _witness: IW,
+    ctx: &mut TxContext,
+): ID {
+    // 1. Assert account ownership and current execution context.
+    account_mod::assert_execution_authorized(
+        account,
+        registry,
+        executable,
+        ExecutionProgressWitness {},
+    );
+
+    // 2. Get current ActionSpec from Executable
+    let specs = executable.intent().action_specs();
+    let action_spec = specs.borrow(executable.action_idx());
+
+    // 3. CRITICAL: Validate action type (using marker type)
+    action_validation::assert_action_type<CreateProtectiveBid<RaiseToken, StableCoin>>(
+        action_spec,
+    );
+
+    // 4. Check version
+    let spec_version = intents::action_spec_version(action_spec);
+    assert!(spec_version == 1, EUnsupportedActionVersion);
+
+    // 5. Deserialize action (pool_id read from FutarchyConfig, not staged)
+    let action_data = intents::action_spec_data(action_spec);
+    let mut reader = bcs::new(*action_data);
+    let stable_resource_name = string::utf8(bcs::peel_vec_u8(&mut reader));
+    let base_fee_bps = bcs::peel_u64(&mut reader);
+    let surge_fee_bps = bcs::peel_u64(&mut reader);
+    let surge_duration_ms = bcs::peel_u64(&mut reader);
+    let dao_amm_asset_principal = bcs::peel_u64(&mut reader);
+    let dao_amm_stable_principal = bcs::peel_u64(&mut reader);
+    bcs_validation::validate_all_bytes_consumed(reader);
+
+    // 6. Read pool_id from FutarchyConfig (ensures bid points to DAO's own pool)
+    let futarchy_config: &FutarchyConfig = account_mod::config(account);
+    let expected_asset_type = futarchy_config::asset_type(futarchy_config);
+    let expected_stable_type = futarchy_config::stable_type(futarchy_config);
+    let actual_asset_type = type_name::with_original_ids<RaiseToken>().into_string().to_string();
+    let actual_stable_type = type_name::with_original_ids<StableCoin>().into_string().to_string();
+    assert!(expected_asset_type == &actual_asset_type, EWrongDaoTypes);
+    assert!(expected_stable_type == &actual_stable_type, EWrongDaoTypes);
+
+    let config_pool_id = futarchy_config::get_spot_pool_id(futarchy_config);
+    assert!(config_pool_id.is_some(), ENoSpotPool);
+    let pool_id = *config_pool_id.borrow();
+
+    // 7. Take stable coins from executable_resources
+    let stable_coin = executable_resources::take_coin(
+        executable,
+        ExecutionProgressWitness {},
+        stable_resource_name,
+    );
+    let initial_stable = coin::value(&stable_coin);
+    assert!(initial_stable > 0, EZeroStable);
+
+    let account_id = object::id(account);
+
+    // 8. Create protective bid.
+    // Both zero means "use pool initial reserves"; otherwise require both non-zero.
+    let stable_balance = stable_coin.into_balance();
+    let bid = if (dao_amm_asset_principal == 0 && dao_amm_stable_principal == 0) {
+        protective_bid::create<RaiseToken, StableCoin>(
+            account_id,
+            pool_id,
+            base_fee_bps,
+            surge_fee_bps,
+            surge_duration_ms,
+            stable_balance,
+            clock,
+            ctx,
+        )
+    } else {
+        assert!(
+            dao_amm_asset_principal > 0 && dao_amm_stable_principal > 0,
+            EInvalidPrincipalOverride,
+        );
+        protective_bid::create_with_principal<RaiseToken, StableCoin>(
+            account_id,
+            pool_id,
+            base_fee_bps,
+            surge_fee_bps,
+            surge_duration_ms,
+            dao_amm_asset_principal,
+            dao_amm_stable_principal,
+            stable_balance,
+            clock,
+            ctx,
+        )
+    };
+
+    let bid_id = object::id(&bid);
+
+    // 9. Emit event
+    event::emit(ProtectiveBidCreatedViaGovernance {
+        bid_id,
+        account_id,
+        pool_id,
+        base_fee_bps,
+        surge_fee_bps,
+        surge_duration_ms,
+        initial_stable,
+    });
+
+    // 10. Enforce 1 protective bid per DAO and record bid ID on the Account as managed data
+    protective_bid_registry::set_from_execution(
+        account,
+        registry,
+        executable,
+        ExecutionProgressWitness {},
+        bid_id,
+        pool_id,
+    );
+
+    // 11. Share the bid
+    transfer::public_share_object(bid);
+
+    // 12. Increment action index
+    executable::increment_action_idx(executable, ExecutionProgressWitness {});
+
+    bid_id
+}
+
+================================================================================
+== protective_bid_actions.move
+================================================================================
+
+// Copyright (c) Govex DAO LLC
+// SPDX-License-Identifier: BUSL-1.1
+
+/// Protective Bid Actions for Governance
+///
+/// This module provides governance-controlled actions for protective bid management:
+/// - CancelProtectiveBid: Cancel bid wall and output funds to executable_resources
+///
+/// Flow:
+/// 1. DAO passes proposal to cancel protective bid
+/// 2. CancelProtectiveBid outputs remaining stable to executable_resources
+/// 3. Next action (e.g., VaultDepositFromResources) deposits to desired vault
+/// 4. After 90 days: anyone can close permissionlessly (deposits to protective-bid-funds vault, or treasury fallback)
+/// 5. Before 90 days: DAO can cancel via CancelProtectiveBid action
+
+/// For creation, see protective_bid_init_actions.move
+
+module futarchy_actions::protective_bid_actions;
+
+public struct ExecutionProgressWitness has drop {}
+
+
+use account_actions::action_spec_builder;
+use account_protocol::account::{Self as account_mod, Account};
+use account_protocol::action_events;
+use account_protocol::action_validation;
+use account_protocol::bcs_validation;
+use account_protocol::executable::{Self, Executable};
+use account_protocol::executable_resources;
+use account_protocol::intents;
+use account_protocol::package_registry::PackageRegistry;
+use futarchy_actions::liquidity_actions;
+use futarchy_markets_core::spot_pool_mutation_auth::SpotPoolMutationRegistry;
+use futarchy_markets_core::protective_bid::{Self, ProtectiveBid};
+use std::string::{Self, String};
+use std::type_name;
+use sui::bcs;
+use sui::event;
+
+// === Errors ===
+
+const EUnsupportedActionVersion: u64 = 1;
+const EWrongBid: u64 = 2;
+
+// === Action Type Markers ===
+// Token types are encoded in the marker to prevent executor from changing types
+
+/// Cancel protective bid action marker
+/// RaiseToken and StableCoin are encoded to ensure executor uses correct types
+public struct CancelProtectiveBid<phantom RaiseToken, phantom StableCoin> has drop {}
+
+// === Events ===
+
+/// Emitted when a protective bid is cancelled via governance
+public struct ProtectiveBidCancelledViaGovernance has copy, drop {
+    bid_id: ID,
+    account_id: ID,
+    stable_returned_to_treasury: u64,
+    tokens_burned: u64,
+}
+
+// === Action Structs for Proposal System ===
+
+/// Action data for cancelling a protective bid
+public struct CancelProtectiveBidAction has copy, drop, store {
+    /// ID of the protective bid to cancel
+    bid_id: ID,
+    /// Resource name for output stable coins (for chaining to VaultDepositFromResources)
+    stable_output_name: String,
+}
+
+// === Spec Builders (for proposal PTB construction) ===
+
+/// Add CancelProtectiveBidAction to Builder
+/// Used for staging actions in proposals via PTB
+/// stable_output_name: Resource name for output coins (next action takes via VaultDepositFromResources)
+public fun add_cancel_protective_bid_spec<RaiseToken, StableCoin>(
+    builder: &mut action_spec_builder::Builder,
+    bid_id: ID,
+    stable_output_name: String,
+) {
+    // Capture action_index BEFORE adding spec
+    let action_index = action_spec_builder::next_action_index(builder);
+
+    // Create action struct
+    let action = CancelProtectiveBidAction { bid_id, stable_output_name };
+
+    // Serialize
+    let action_data = bcs::to_bytes(&action);
+
+    // CRITICAL: Use marker type (not action struct type) for validation
+    let action_spec = intents::new_action_spec_with_typename(
+        type_name::with_original_ids<CancelProtectiveBid<RaiseToken, StableCoin>>(),
+        action_data,
+        1, // version 1
+    );
+    action_spec_builder::add(builder, action_spec);
+
+    // Emit ActionParamsStaged event
+    let mut params = action_events::new_builder();
+    action_events::add_id(&mut params, b"bid_id", bid_id);
+    action_events::add_string(&mut params, b"stable_output_name", action.stable_output_name);
+    action_events::emit_action_params(
+        params,
+        action_spec_builder::source_type(builder),
+        action_spec_builder::source_id(builder),
+        action_spec_builder::outcome_index(builder),
+        type_name::with_original_ids<CancelProtectiveBid<RaiseToken, StableCoin>>().into_string().to_string(),
+        action_index,
+    );
+}
+
+// === Execution Functions (for Proposal System) ===
+
+/// Execute cancel protective bid action from proposal
+/// Returns remaining stable to executable_resources (next action deposits to vault)
+/// Authority can cancel anytime (no time requirement)
+public fun do_cancel_protective_bid<
+    RaiseToken,
+    StableCoin,
+    Outcome: store,
+    IW: drop,
+>(
+    executable: &mut Executable<Outcome>,
+    account: &mut Account,
+    registry: &PackageRegistry,
+    spot_pool_mutation_registry: &SpotPoolMutationRegistry,
+    bid: &mut ProtectiveBid<RaiseToken, StableCoin>,
+    _witness: IW,
+    ctx: &mut TxContext,
+) {
+    // 1. Assert account ownership and current execution context.
+    account_mod::assert_execution_authorized(
+        account,
+        registry,
+        executable,
+        ExecutionProgressWitness {},
+    );
+
+    // 2. Get current ActionSpec from Executable
+    let specs = executable.intent().action_specs();
+    let action_spec = specs.borrow(executable.action_idx());
+
+    // 3. CRITICAL: Validate action type
+    action_validation::assert_action_type<CancelProtectiveBid<RaiseToken, StableCoin>>(
+        action_spec,
+    );
+
+    // 4. Check version
+    let spec_version = intents::action_spec_version(action_spec);
+    assert!(spec_version == 1, EUnsupportedActionVersion);
+
+    // 5. Deserialize action
+    let action_data = intents::action_spec_data(action_spec);
+    let mut reader = bcs::new(*action_data);
+    let staged_bid_id = object::id_from_address(bcs::peel_address(&mut reader));
+    let stable_output_name = string::utf8(bcs::peel_vec_u8(&mut reader));
+
+    // 6. Validate all bytes consumed
+    bcs_validation::validate_all_bytes_consumed(reader);
+
+    // 7. Verify bid matches staged ID
+    assert!(object::id(bid) == staged_bid_id, EWrongBid);
+
+    // 8. Verify bid belongs to this account
+    assert!(protective_bid::account_id(bid) == object::id(account), EWrongBid);
+
+    // Capture state before cancel
+    let stable_remaining = protective_bid::remaining_stable(bid);
+    let tokens_bought = protective_bid::base_bought_amount(bid);
+
+    // 9. Create SpotPoolMutationAuth for authorized cancellation.
+    // Note: only allowed witness modules can create this auth; we obtain it via liquidity_actions.
+    let spot_auth = liquidity_actions::new_spot_pool_mutation_auth(spot_pool_mutation_registry, object::id(bid));
+
+    // 10. Cancel the bid - returns stable coin and clears registry atomically
+    let stable_coin = protective_bid::cancel<RaiseToken, StableCoin>(
+        bid,
+        account,
+        registry,
+        spot_auth,
+        ctx,
+    );
+
+    // 11. Provide stable to executable_resources (next action deposits to vault)
+    executable_resources::provide_coin(
+        executable,
+        ExecutionProgressWitness {},
+        stable_output_name,
+        stable_coin,
+        ctx,
+    );
+
+    // 13. Emit event
+    event::emit(ProtectiveBidCancelledViaGovernance {
+        bid_id: object::id(bid),
+        account_id: object::id(account),
+        stable_returned_to_treasury: stable_remaining,
+        tokens_burned: tokens_bought,
+    });
+
+    // 14. Increment action index
+    executable::increment_action_idx(executable, ExecutionProgressWitness {});
+}
+
+================================================================================
+== protective_ask_init_actions.move
+================================================================================
+
+// Copyright (c) Govex DAO LLC
+// SPDX-License-Identifier: BUSL-1.1
+
+/// Protective Ask Init Actions for Governance
+///
+/// This module provides governance-controlled actions for creating protective asks:
+/// - CreateProtectiveAsk: Create a NAV-priced mint-on-demand ask wall for token buyers
+///
+/// Flow:
+/// 1. DAO passes proposal to create protective ask
+/// 2. CreateProtectiveAsk creates shared ask object with max mint quota
+/// 3. Users buy/mint in chunks up to remaining quota
+/// 4. Multiple asks per DAO are allowed
+///
+/// For cancellation, see protective_ask_actions.move
+module futarchy_actions::protective_ask_init_actions;
+
+public struct ExecutionProgressWitness has drop {}
+
+
+use account_actions::action_spec_builder;
+use account_protocol::account::{Self as account_mod, Account};
+use account_protocol::action_events;
+use account_protocol::action_validation;
+use account_protocol::bcs_validation;
+use account_protocol::executable::{Self, Executable};
+use account_protocol::intents;
+use account_protocol::package_registry::PackageRegistry;
+use futarchy_core::futarchy_config::{Self, FutarchyConfig};
+use futarchy_markets_core::protective_ask;
+use std::type_name;
+use sui::bcs;
+use sui::clock::Clock;
+use sui::event;
+
+// === Errors ===
+
+const EUnsupportedActionVersion: u64 = 1;
+const EZeroMaxMintAmount: u64 = 2;
+const ENoSpotPool: u64 = 3;
+const EWrongDaoTypes: u64 = 4;
+const EInvalidPrincipalOverride: u64 = 5;
+
+// === Action Type Markers ===
+// Token types are encoded in the marker to prevent executor from changing types
+
+/// Create protective ask action marker
+public struct CreateProtectiveAsk<phantom RaiseToken, phantom StableCoin> has drop {}
+
+// === Events ===
+
+/// Emitted when a protective ask is created via governance
+public struct ProtectiveAskCreatedViaGovernance has copy, drop {
+    ask_id: ID,
+    account_id: ID,
+    pool_id: ID,
+    max_mint_amount: u64,
+}
+
+// === Action Structs for Proposal System ===
+
+/// Action data for creating a protective ask
+public struct CreateProtectiveAskAction has copy, drop, store {
+    /// Maximum RaiseToken amount that can be minted via this ask wall.
+    max_mint_amount: u64,
+    /// DAO AMM principal RaiseToken amount to use in NAV (fixed, optional via zero sentinel).
+    dao_amm_asset_principal: u64,
+    /// DAO AMM principal StableCoin amount to use in NAV (fixed, optional via zero sentinel).
+    dao_amm_stable_principal: u64,
+}
+
+// === Spec Builders (for proposal PTB construction) ===
+
+/// Add CreateProtectiveAskAction to Builder
+public fun add_create_protective_ask_spec<RaiseToken, StableCoin>(
+    builder: &mut action_spec_builder::Builder,
+    max_mint_amount: u64,
+    dao_amm_asset_principal: u64,
+    dao_amm_stable_principal: u64,
+) {
+    let action_index = action_spec_builder::next_action_index(builder);
+
+    let action = CreateProtectiveAskAction {
+        max_mint_amount,
+        dao_amm_asset_principal,
+        dao_amm_stable_principal,
+    };
+
+    let action_data = bcs::to_bytes(&action);
+
+    let action_spec = intents::new_action_spec_with_typename(
+        type_name::with_original_ids<CreateProtectiveAsk<RaiseToken, StableCoin>>(),
+        action_data,
+        1, // version
+    );
+    action_spec_builder::add(builder, action_spec);
+
+    let mut params = action_events::new_builder();
+    action_events::add_u64(&mut params, b"max_mint_amount", max_mint_amount);
+    action_events::add_u64(&mut params, b"dao_amm_asset_principal", dao_amm_asset_principal);
+    action_events::add_u64(&mut params, b"dao_amm_stable_principal", dao_amm_stable_principal);
+    action_events::emit_action_params(
+        params,
+        action_spec_builder::source_type(builder),
+        action_spec_builder::source_id(builder),
+        action_spec_builder::outcome_index(builder),
+        type_name::with_original_ids<CreateProtectiveAsk<RaiseToken, StableCoin>>().into_string().to_string(),
+        action_index,
+    );
+}
+
+// === Execution Functions (for Proposal System) ===
+
+/// Execute create protective ask action from proposal
+/// Creates a shared ProtectiveAsk for token buyers to mint from.
+public fun do_create_protective_ask<RaiseToken, StableCoin, Outcome: store, IW: drop>(
+    executable: &mut Executable<Outcome>,
+    account: &mut Account,
+    registry: &PackageRegistry,
+    clock: &Clock,
+    _witness: IW,
+    ctx: &mut TxContext,
+): ID {
+    // 1. Assert account ownership and current execution context.
+    account_mod::assert_execution_authorized(
+        account,
+        registry,
+        executable,
+        ExecutionProgressWitness {},
+    );
+
+    // 2. Get current ActionSpec from Executable
+    let specs = executable.intent().action_specs();
+    let action_spec = specs.borrow(executable.action_idx());
+
+    // 3. CRITICAL: Validate action type (using marker type)
+    action_validation::assert_action_type<CreateProtectiveAsk<RaiseToken, StableCoin>>(
+        action_spec,
+    );
+
+    // 4. Check version
+    let spec_version = intents::action_spec_version(action_spec);
+    assert!(spec_version == 1, EUnsupportedActionVersion);
+
+    // 5. Deserialize action (pool_id read from FutarchyConfig, not staged)
+    let action_data = intents::action_spec_data(action_spec);
+    let mut reader = bcs::new(*action_data);
+    let max_mint_amount = bcs::peel_u64(&mut reader);
+    let dao_amm_asset_principal = bcs::peel_u64(&mut reader);
+    let dao_amm_stable_principal = bcs::peel_u64(&mut reader);
+    bcs_validation::validate_all_bytes_consumed(reader);
+
+    assert!(max_mint_amount > 0, EZeroMaxMintAmount);
+
+    // 6. Read pool_id from FutarchyConfig (ensures ask points to DAO's own pool)
+    let futarchy_config: &FutarchyConfig = account_mod::config(account);
+    let expected_asset_type = futarchy_config::asset_type(futarchy_config);
+    let expected_stable_type = futarchy_config::stable_type(futarchy_config);
+    let actual_asset_type = type_name::with_original_ids<RaiseToken>().into_string().to_string();
+    let actual_stable_type = type_name::with_original_ids<StableCoin>().into_string().to_string();
+    assert!(expected_asset_type == &actual_asset_type, EWrongDaoTypes);
+    assert!(expected_stable_type == &actual_stable_type, EWrongDaoTypes);
+
+    let config_pool_id = futarchy_config::get_spot_pool_id(futarchy_config);
+    assert!(config_pool_id.is_some(), ENoSpotPool);
+    let pool_id = *config_pool_id.borrow();
+
+    let account_id = object::id(account);
+
+    // 7. Create protective ask
+    let ask = if (dao_amm_asset_principal == 0 && dao_amm_stable_principal == 0) {
+        protective_ask::create<RaiseToken, StableCoin>(
+            account_id,
+            pool_id,
+            max_mint_amount,
+            clock,
+            ctx,
+        )
+    } else {
+        assert!(
+            dao_amm_asset_principal > 0 && dao_amm_stable_principal > 0,
+            EInvalidPrincipalOverride,
+        );
+        protective_ask::create_with_principal<RaiseToken, StableCoin>(
+            account_id,
+            pool_id,
+            max_mint_amount,
+            dao_amm_asset_principal,
+            dao_amm_stable_principal,
+            clock,
+            ctx,
+        )
+    };
+
+    let ask_id = object::id(&ask);
+
+    // 8. Emit event
+    event::emit(ProtectiveAskCreatedViaGovernance {
+        ask_id,
+        account_id,
+        pool_id,
+        max_mint_amount,
+    });
+
+    // 9. Share the ask (multiple asks per DAO are allowed)
+    sui::transfer::public_share_object(ask);
+
+    // 10. Increment action index
+    executable::increment_action_idx(executable, ExecutionProgressWitness {});
+
+    ask_id
+}
+
+================================================================================
+== protective_ask_actions.move
+================================================================================
+
+// Copyright (c) Govex DAO LLC
+// SPDX-License-Identifier: BUSL-1.1
+
+/// Protective Ask Actions for Governance
+///
+/// This module provides governance-controlled actions for protective ask management:
+/// - CancelProtectiveAsk: Cancel ask wall
+///
+/// Flow:
+/// 1. DAO passes proposal to cancel protective ask
+/// 2. Ask proceeds are already in treasury (deposited on each buy)
+/// 3. After 90 days: anyone can close permissionlessly
+module futarchy_actions::protective_ask_actions;
+
+public struct ExecutionProgressWitness has drop {}
+
+
+use account_actions::action_spec_builder;
+use account_protocol::account::{Self as account_mod, Account};
+use account_protocol::action_events;
+use account_protocol::action_validation;
+use account_protocol::bcs_validation;
+use account_protocol::executable::{Self, Executable};
+use account_protocol::intents;
+use account_protocol::package_registry::PackageRegistry;
+use futarchy_actions::liquidity_actions;
+use futarchy_markets_core::spot_pool_mutation_auth::SpotPoolMutationRegistry;
+use futarchy_markets_core::protective_ask::{Self, ProtectiveAsk};
+use std::type_name;
+use sui::bcs;
+use sui::coin;
+use sui::event;
+
+// === Errors ===
+
+const EUnsupportedActionVersion: u64 = 1;
+const EWrongAsk: u64 = 2;
+
+// === Action Type Markers ===
+// Token types are encoded in the marker to prevent executor from changing types
+
+/// Cancel protective ask action marker
+public struct CancelProtectiveAsk<phantom RaiseToken, phantom StableCoin> has drop {}
+
+// === Events ===
+
+/// Emitted when a protective ask is cancelled via governance
+public struct ProtectiveAskCancelledViaGovernance has copy, drop {
+    ask_id: ID,
+    account_id: ID,
+    stable_returned_to_treasury: u64,
+    total_minted: u64,
+}
+
+// === Action Structs for Proposal System ===
+
+/// Action data for cancelling a protective ask
+public struct CancelProtectiveAskAction has copy, drop, store {
+    /// ID of the protective ask to cancel
+    ask_id: ID,
+}
+
+// === Spec Builders (for proposal PTB construction) ===
+
+/// Add CancelProtectiveAskAction to Builder
+public fun add_cancel_protective_ask_spec<RaiseToken, StableCoin>(
+    builder: &mut action_spec_builder::Builder,
+    ask_id: ID,
+) {
+    let action_index = action_spec_builder::next_action_index(builder);
+
+    let action = CancelProtectiveAskAction { ask_id };
+    let action_data = bcs::to_bytes(&action);
+
+    let action_spec = intents::new_action_spec_with_typename(
+        type_name::with_original_ids<CancelProtectiveAsk<RaiseToken, StableCoin>>(),
+        action_data,
+        1, // version 1
+    );
+    action_spec_builder::add(builder, action_spec);
+
+    let mut params = action_events::new_builder();
+    action_events::add_id(&mut params, b"ask_id", ask_id);
+    action_events::emit_action_params(
+        params,
+        action_spec_builder::source_type(builder),
+        action_spec_builder::source_id(builder),
+        action_spec_builder::outcome_index(builder),
+        type_name::with_original_ids<CancelProtectiveAsk<RaiseToken, StableCoin>>().into_string().to_string(),
+        action_index,
+    );
+}
+
+// === Execution Functions (for Proposal System) ===
+
+/// Execute cancel protective ask action from proposal
+public fun do_cancel_protective_ask<
+    RaiseToken,
+    StableCoin,
+    Outcome: store,
+    IW: drop,
+>(
+    executable: &mut Executable<Outcome>,
+    account: &mut Account,
+    registry: &PackageRegistry,
+    spot_pool_mutation_registry: &SpotPoolMutationRegistry,
+    ask: &mut ProtectiveAsk<RaiseToken, StableCoin>,
+    _witness: IW,
+    ctx: &mut TxContext,
+) {
+    // 1. Assert account ownership and current execution context.
+    account_mod::assert_execution_authorized(
+        account,
+        registry,
+        executable,
+        ExecutionProgressWitness {},
+    );
+
+    // 2. Get current ActionSpec from Executable
+    let specs = executable.intent().action_specs();
+    let action_spec = specs.borrow(executable.action_idx());
+
+    // 3. CRITICAL: Validate action type
+    action_validation::assert_action_type<CancelProtectiveAsk<RaiseToken, StableCoin>>(
+        action_spec,
+    );
+
+    // 4. Check version
+    let spec_version = intents::action_spec_version(action_spec);
+    assert!(spec_version == 1, EUnsupportedActionVersion);
+
+    // 5. Deserialize action
+    let action_data = intents::action_spec_data(action_spec);
+    let mut reader = bcs::new(*action_data);
+    let staged_ask_id = object::id_from_address(bcs::peel_address(&mut reader));
+    bcs_validation::validate_all_bytes_consumed(reader);
+
+    // 6. Verify ask matches staged ID and DAO
+    assert!(object::id(ask) == staged_ask_id, EWrongAsk);
+    assert!(protective_ask::account_id(ask) == object::id(account), EWrongAsk);
+
+    let stable_remaining = protective_ask::remaining_stable(ask);
+    let total_minted = protective_ask::minted_amount(ask);
+
+    // 7. Create SpotPoolMutationAuth for authorized cancellation.
+    let spot_auth = liquidity_actions::new_spot_pool_mutation_auth(
+        spot_pool_mutation_registry,
+        object::id(ask),
+    );
+
+    // 8. Cancel ask.
+    let stable_coin = protective_ask::cancel<RaiseToken, StableCoin>(
+        ask,
+        account,
+        registry,
+        spot_auth,
+        ctx,
+    );
+    coin::destroy_zero(stable_coin);
+
+    // 9. Emit event
+    event::emit(ProtectiveAskCancelledViaGovernance {
+        ask_id: object::id(ask),
+        account_id: object::id(account),
+        stable_returned_to_treasury: stable_remaining,
+        total_minted,
+    });
+
+    // 10. Increment action index
+    executable::increment_action_idx(executable, ExecutionProgressWitness {});
+}

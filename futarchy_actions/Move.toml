@@ -1,0 +1,23 @@
+# Futarchy-related actions for the smart account
+# Config, quota, dissolution, liquidity actions
+
+[package]
+name = "futarchy_actions"
+edition = "2024.beta"
+published-at = "0x12cb3c69cbbfb1e8e647993dd8a83b4624a81c815ee867af8f5c5be3933e0839"
+
+[dependencies]
+AccountProtocol = { local = "../../smart_account/protocol" }
+AccountActions = { local = "../../smart_account/actions" }
+futarchy_one_shot_utils = { local = "../futarchy_one_shot_utils" }
+futarchy_core = { local = "../futarchy_core" }
+futarchy_markets_primitives = { local = "../futarchy_markets_primitives" }
+futarchy_markets_core = { local = "../futarchy_markets_core" }
+futarchy_proposal = { local = "../futarchy_proposal" }
+[addresses]
+futarchy_actions = "0x12cb3c69cbbfb1e8e647993dd8a83b4624a81c815ee867af8f5c5be3933e0839"
+
+[environments]
+mainnet = "35834a8a"
+testnet = "4c78adac"
+localnet = "4afd09da"

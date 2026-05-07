@@ -1,0 +1,23 @@
+# User-facing swap and liquidity operations
+# Entry points for swaps, liquidity provision, and arbitrage
+
+[package]
+published-at = "0x7279de2610213cdc1da0945f41f7ef7a58abf343e88165fb443be60f066e00a2"
+name = "futarchy_markets_operations"
+edition = "2024"
+license = "BSL"
+
+[dependencies]
+futarchy_markets_core = { local = "../futarchy_markets_core" }
+futarchy_markets_primitives = { local = "../futarchy_markets_primitives" }
+futarchy_one_shot_utils = { local = "../futarchy_one_shot_utils" }
+futarchy_core = { local = "../futarchy_core" }
+futarchy_proposal = { local = "../futarchy_proposal" }
+
+[addresses]
+futarchy_markets_operations = "0x7279de2610213cdc1da0945f41f7ef7a58abf343e88165fb443be60f066e00a2"
+
+[environments]
+mainnet = "35834a8a"
+testnet = "4c78adac"
+localnet = "4afd09da"

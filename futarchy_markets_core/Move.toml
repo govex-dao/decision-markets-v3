@@ -1,0 +1,22 @@
+# Spot pool, arbitrage, and quantum LP (stable AMM layer)
+# Unified spot pool, auto-arbitrage, fee management, swap core
+
+[package]
+published-at = "0x9a470e2a272f1aa1f81f5cd2a3066f878fffd9ce9c8d22309ad62f81e5b77dd2"
+name = "futarchy_markets_core"
+edition = "2024"
+license = "BSL"
+
+[dependencies]
+AccountActions = { local = "../../smart_account/actions" }
+futarchy_one_shot_utils = { local = "../futarchy_one_shot_utils" }
+futarchy_markets_primitives = { local = "../futarchy_markets_primitives" }
+futarchy_core = { local = "../futarchy_core" }
+
+[addresses]
+futarchy_markets_core = "0x9a470e2a272f1aa1f81f5cd2a3066f878fffd9ce9c8d22309ad62f81e5b77dd2"
+
+[environments]
+mainnet = "35834a8a"
+testnet = "4c78adac"
+localnet = "4afd09da"

@@ -1,0 +1,20 @@
+# Auxiliary helper utilities
+# Math, vectors, constants, metadata, blank coins
+
+[package]
+published-at = "0x8085d42c3f597247c761e0a15e56d201a6e9727f2dff5a1d794491416b5ce82f"
+name = "futarchy_one_shot_utils"
+edition = "2024"
+license = "BSL"
+
+[dependencies]
+conditional_coin = { local = "../conditional_coin" }
+futarchy_config = { local = "../futarchy_config/active" }
+
+[addresses]
+futarchy_one_shot_utils = "0x8085d42c3f597247c761e0a15e56d201a6e9727f2dff5a1d794491416b5ce82f"
+
+[environments]
+mainnet = "35834a8a"
+testnet = "4c78adac"
+localnet = "4afd09da"

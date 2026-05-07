@@ -1,0 +1,22 @@
+# Oracle actions for the smart account
+# TWAP oracle initialization and management
+
+[package]
+name = "futarchy_oracle"
+edition = "2024.beta"
+published-at = "0xfabcfa08e80041d07da61540451725deddad5996952b8b6e2e295c50be3417c2"
+
+[dependencies]
+AccountActions = { local = "../../smart_account/actions" }
+futarchy_one_shot_utils = { local = "../futarchy_one_shot_utils" }
+futarchy_core = { local = "../futarchy_core" }
+futarchy_markets_core = { local = "../futarchy_markets_core" }
+futarchy_markets_primitives = { local = "../futarchy_markets_primitives" }
+AccountProtocol = { local = "../../smart_account/protocol" }
+[addresses]
+futarchy_oracle = "0xfabcfa08e80041d07da61540451725deddad5996952b8b6e2e295c50be3417c2"
+
+[environments]
+mainnet = "35834a8a"
+testnet = "4c78adac"
+localnet = "4afd09da"

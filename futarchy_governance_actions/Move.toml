@@ -1,0 +1,25 @@
+# Governance actions for the smart account
+# Package registry, protocol admin, governance intents, intent janitor
+
+[package]
+name = "futarchy_governance_actions"
+edition = "2024.beta"
+published-at = "0xfad6acc479e56aab0f45264c175f6c86696798641221188aa14cacf280d90619"
+
+[dependencies]
+AccountProtocol = { local = "../../smart_account/protocol" }
+AccountActions = { local = "../../smart_account/actions" }
+futarchy_one_shot_utils = { local = "../futarchy_one_shot_utils" }
+futarchy_core = { local = "../futarchy_core" }
+futarchy_markets_primitives = { local = "../futarchy_markets_primitives" }
+# futarchy_lifecycle = { local = "../futarchy_dissolution_actions" } # Circular dependency removed
+futarchy_factory = { local = "../futarchy_factory" }
+futarchy_proposal = { local = "../futarchy_proposal" }
+[addresses]
+futarchy_governance_actions = "0xfad6acc479e56aab0f45264c175f6c86696798641221188aa14cacf280d90619"
+futarchy_governance_addr = "0x0"
+
+[environments]
+mainnet = "35834a8a"
+testnet = "4c78adac"
+localnet = "4afd09da"

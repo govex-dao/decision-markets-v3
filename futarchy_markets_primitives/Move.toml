@@ -1,0 +1,20 @@
+# AMM primitives, oracles, and escrow
+# Conditional AMM, coin escrow, TWAP oracle, fee scheduler, market state
+
+[package]
+published-at = "0x844fcce6ab4bbfb44b09431b0f07765d671d2aee3122f578b15b2402c2033781"
+name = "futarchy_markets_primitives"
+edition = "2024"
+license = "BSL"
+
+[dependencies]
+futarchy_one_shot_utils = { local = "../futarchy_one_shot_utils" }
+futarchy_core = { local = "../futarchy_core" }
+
+[addresses]
+futarchy_markets_primitives = "0x844fcce6ab4bbfb44b09431b0f07765d671d2aee3122f578b15b2402c2033781"
+
+[environments]
+mainnet = "35834a8a"
+testnet = "4c78adac"
+localnet = "4afd09da"
