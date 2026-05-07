@@ -2,6 +2,8 @@
 
 A highly configurable decision market platform with an `x*y=k` style AMM that splits liquidity across spot and conditional market outcomes to keep decisions high-signal. This is a configuration of the [Sui smart account](https://github.com/govex-dao/smart-account-v3) that orchestrates actions based on their predicted impact on an organization's token price.
 
+This package implements various organizational lifecycle steps as smart-account-compatible actions, namely dissolution, price-based unlocks, fundraising, and buybacks.
+
 | Package name | Mainnet package ID |
 |---|---|
 | `futarchy_actions` | `0x12cb3c69cbbfb1e8e647993dd8a83b4624a81c815ee867af8f5c5be3933e0839` |
