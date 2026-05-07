@@ -19,9 +19,9 @@ Production Move code, excluding tests, in:
 
 | Severity | Description | Reward |
 | -------- | ----------- | ------ |
-| Critical | Direct loss of funds | $15,000 |
-| Critical | Permanent bricking or freezing of funds | $15,000 |
-| Critical | Critical corruption or unauthorized alteration of governance outcomes | $15,000 |
+| Critical | Direct theft of funds by unprivliedged user | $15,000 |
+| Critical | Permanent bricking or freezing of funds that doesnt require privledged access or unlikely preconditions| $15,000 |
+| Critical | Critical corruption or unauthorized alteration of governance outcomes that doesnt require privledged access or unlikely preconditions | $15,000 |
 
 ## Rules
 
