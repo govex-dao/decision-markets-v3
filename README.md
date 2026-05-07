@@ -1,6 +1,6 @@
 # Decision Markets
 
-A highly configurable decision market platform with an `x*y=k`-style AMM that splits liquidity across outcomes to keep markets liquid and decisions high-signal.
+A highly configurable decision market platform with an `x*y=k`-style AMM that splits liquidity across spot and conditional market outcomes to keep decisions high-signal. This is a configuration of the Sui smart account https://github.com/govex-dao/smart-account-v3 that orchestrates action based on their predicted impact on a organizations token price.
 
 | Package name | Mainnet package ID |
 |---|---|
