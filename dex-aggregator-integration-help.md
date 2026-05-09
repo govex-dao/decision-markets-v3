@@ -58,28 +58,3 @@ There are two user-facing spot swap functions for aggregator execution:
 ```
 
 Use these two `swap_entry` functions for the full aggregator path. The lower-level `unified_spot_pool::swap_stable_for_asset` and `unified_spot_pool::swap_asset_for_stable` functions only cover the direct spot leg and do not fully handle active proposal routing through wrapped conditional markets.
-
-## Price State Needed
-
-For the direct spot leg, quote from `UnifiedSpotPool` fields:
-
-- `asset_reserve`
-- `stable_reserve`
-- `fee_bps`
-- `fee_schedule`
-- `fee_schedule_activation_time`
-- `active_proposal_id`
-- `is_dissolved`
-
-When `aggregator_config.active_escrow` is present and its `MarketState` allows swaps at the current `Clock`, exact route price also depends on:
-
-- `TokenEscrow.escrowed_asset`
-- `TokenEscrow.escrowed_stable`
-- `MarketState.status`
-- `MarketState.trading_end`
-- `MarketState.execution_deadline`
-- every `LiquidityPool.asset_reserve`
-- every `LiquidityPool.stable_reserve`
-- every `LiquidityPool.fee_percent`
-
-The live route searches for the best split between direct spot and the conditional route. The conditional route uses all outcome pools and takes the minimum output across outcomes, capped by escrow backing.
